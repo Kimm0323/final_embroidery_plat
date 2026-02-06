@@ -3,215 +3,197 @@ session_start();
 require_once '../config/db.php';
 require_role('hr');
 
+$hr_id = $_SESSION['user']['id'];
 $hr_name = htmlspecialchars($_SESSION['user']['fullname'] ?? 'HR Lead');
 
-$hiring_kpis = [
-    [
-        'label' => 'Open roles',
-        'value' => 8,
-        'note' => 'Across 3 departments',
-        'icon' => 'fas fa-briefcase',
-        'tone' => 'primary',
-    ],
-    [
-        'label' => 'Applicants this week',
-        'value' => 46,
-        'note' => 'Up 12% vs last week',
-        'icon' => 'fas fa-user-plus',
-        'tone' => 'success',
-    ],
-    [
-        'label' => 'Interviews scheduled',
-        'value' => 12,
-        'note' => 'Next 5 business days',
-        'icon' => 'fas fa-calendar-check',
-        'tone' => 'info',
-    ],
-    [
-        'label' => 'Offers pending',
-        'value' => 3,
-        'note' => 'Awaiting approvals',
-        'icon' => 'fas fa-file-signature',
-        'tone' => 'warning',
-    ],
-];
+$hr_stmt = $pdo->prepare("
+    SELECT se.shop_id, s.shop_name
+    FROM shop_staffs se
+    JOIN shops s ON se.shop_id = s.id
+    WHERE se.user_id = ? AND se.staff_role = 'hr' AND se.status = 'active'
+");
+$hr_stmt->execute([$hr_id]);
+$hr_shop = $hr_stmt->fetch();
 
-$active_postings = [
-    [
-        'role' => 'Senior Embroidery Technician',
-        'team' => 'Production',
-        'location' => 'Onsite - Cebu City',
-        'posted' => 'Aug 12, 2024',
-        'expires' => 'Sep 12, 2024',
-        'status' => 'Live',
-    ],
-    [
-        'role' => 'Quality Control Lead',
-        'team' => 'Quality Assurance',
-        'location' => 'Onsite - Makati',
-        'posted' => 'Aug 18, 2024',
-        'expires' => 'Sep 18, 2024',
-        'status' => 'Live',
-    ],
-    [
-        'role' => 'Customer Success Associate',
-        'team' => 'Client Support',
-        'location' => 'Hybrid - Taguig',
-        'posted' => 'Aug 21, 2024',
-        'expires' => 'Sep 4, 2024',
-        'status' => 'Closing soon',
-    ],
-    [
-        'role' => 'Warehouse Runner',
-        'team' => 'Logistics',
-        'location' => 'Onsite - Quezon City',
-        'posted' => 'Aug 23, 2024',
-        'expires' => 'Sep 23, 2024',
-        'status' => 'Live',
-    ],
-];
+if (!$hr_shop) {
+    die('You are not assigned to any shop as HR. Please contact your shop owner.');
+}
 
-$visibility_channels = [
-    [
-        'channel' => 'Internal talent pool',
-        'audience' => 'Active & alumni staff',
-        'reach' => '85 profiles',
-        'status' => 'Active',
-    ],
-    [
-        'channel' => 'Public job boards',
-        'audience' => 'External candidates',
-        'reach' => '3 platforms',
-        'status' => 'Scheduled',
-    ],
-    [
-        'channel' => 'Referral program',
-        'audience' => 'staff referrals',
-        'reach' => '12 ambassadors',
-        'status' => 'Active',
-    ],
-];
+$shop_id = (int) $hr_shop['shop_id'];
+$shop_name = $hr_shop['shop_name'];
+$success = null;
+$error = null;
 
-$alert_queue = [
-    [
-        'title' => 'New applicant',
-        'detail' => 'Alina Reyes applied for Senior Embroidery Technician.',
-        'time' => '2h ago',
-        'tone' => 'primary',
-    ],
-    [
-        'title' => 'Interview feedback overdue',
-        'detail' => 'QC Lead panel feedback pending for 2 candidates.',
-        'time' => 'Today',
-        'tone' => 'warning',
-    ],
-    [
-        'title' => 'Posting expiring soon',
-        'detail' => 'Customer Success Associate role expires in 3 days.',
-        'time' => 'Tomorrow',
-        'tone' => 'danger',
-    ],
-];
+$expire_stmt = $pdo->prepare("
+    UPDATE hiring_posts
+    SET status = 'expired'
+    WHERE shop_id = ?
+      AND expires_at IS NOT NULL
+      AND expires_at < NOW()
+      AND status <> 'expired'
+");
+$expire_stmt->execute([$shop_id]);
 
-$automation_rules = [
-    [
-        'title' => 'Auto-expiration',
-        'detail' => 'Close hiring posts 30 days after publishing unless extended.',
-        'icon' => 'fas fa-hourglass-end',
-    ],
-    [
-        'title' => 'Hiring alerts',
-        'detail' => 'Notify HR leads and hiring managers when new applicants arrive.',
-        'icon' => 'fas fa-bell',
-    ],
-    [
-        'title' => 'Visibility booster',
-        'detail' => 'Refresh listings across channels every 7 days for priority roles.',
-        'icon' => 'fas fa-bullhorn',
-    ],
-];
+function normalize_datetime(?string $input): ?string {
+    if (!$input) {
+        return null;
+    }
+    $timestamp = strtotime($input);
+    if ($timestamp === false) {
+        return null;
+    }
+    return date('Y-m-d H:i:s', $timestamp);
+}
 
-$workflow_steps = [
-    [
-        'title' => 'Post request intake',
-        'detail' => 'Capture hiring need, budget approval, and target start date.',
-    ],
-    [
-        'title' => 'Publish & distribute',
-        'detail' => 'Launch across internal pools, referrals, and job boards.',
-    ],
-    [
-        'title' => 'Screen & shortlist',
-        'detail' => 'Score applicants, schedule interviews, and log feedback.',
-    ],
-    [
-        'title' => 'Offer & onboarding',
-        'detail' => 'Issue offer letters and coordinate onboarding tasks.',
-    ],
-];
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    $title = sanitize($_POST['title'] ?? '');
+    $description = trim($_POST['description'] ?? '');
+    $status = $_POST['status'] ?? 'draft';
+    $expires_at = normalize_datetime($_POST['expires_at'] ?? null);
+
+    if (in_array($action, ['create', 'update'], true)) {
+        if ($title === '') {
+            $error = 'Please provide a role title.';
+        } elseif (!in_array($status, ['draft', 'live', 'closed', 'expired'], true)) {
+            $error = 'Invalid status selected.';
+        }
+    }
+
+    if (!$error) {
+        if ($action === 'create') {
+            $stmt = $pdo->prepare("
+                INSERT INTO hiring_posts (shop_id, created_by, title, description, status, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ");
+            $stmt->execute([
+                $shop_id,
+                $hr_id,
+                $title,
+                $description ?: null,
+                $status,
+                $expires_at,
+            ]);
+            $success = 'Hiring post created successfully.';
+        } elseif ($action === 'update') {
+            $post_id = (int) ($_POST['post_id'] ?? 0);
+            $stmt = $pdo->prepare("
+                UPDATE hiring_posts
+                SET title = ?, description = ?, status = ?, expires_at = ?
+                WHERE id = ? AND shop_id = ?
+            ");
+            $stmt->execute([
+                $title,
+                $description ?: null,
+                $status,
+                $expires_at,
+                $post_id,
+                $shop_id,
+            ]);
+            $success = 'Hiring post updated successfully.';
+        } elseif ($action === 'delete') {
+            $post_id = (int) ($_POST['post_id'] ?? 0);
+            $stmt = $pdo->prepare("DELETE FROM hiring_posts WHERE id = ? AND shop_id = ?");
+            $stmt->execute([$post_id, $shop_id]);
+            $success = 'Hiring post deleted.';
+        }
+    }
+}
+
+$edit_post = null;
+$edit_id = isset($_GET['edit']) ? (int) $_GET['edit'] : 0;
+if ($edit_id) {
+    $edit_stmt = $pdo->prepare("
+        SELECT id, title, description, status, expires_at
+        FROM hiring_posts
+        WHERE id = ? AND shop_id = ?
+    ");
+    $edit_stmt->execute([$edit_id, $shop_id]);
+    $edit_post = $edit_stmt->fetch();
+}
+
+$posts_stmt = $pdo->prepare("
+    SELECT id, title, description, status, expires_at, created_at
+    FROM hiring_posts
+    WHERE shop_id = ?
+    ORDER BY created_at DESC
+");
+$posts_stmt->execute([$shop_id]);
+$hiring_posts = $posts_stmt->fetchAll();
+
+function status_badge_class(string $status): string {
+    return match ($status) {
+        'live' => 'badge-success',
+        'draft' => 'badge-warning',
+        'closed' => 'badge-secondary',
+        'expired' => 'badge-danger',
+        default => 'badge-outline',
+    };
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HR Hiring Management Module</title>
+    <title>Hiring Management</title>
     <link rel="stylesheet" href="../assets/css/style.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        .hiring-grid {
+          .hiring-layout {
             display: grid;
             grid-template-columns: repeat(12, 1fr);
             gap: 1.5rem;
-            margin: 2rem 0;
+             margin-top: 2rem;
         }
 
-        .hiring-kpi {
-            grid-column: span 3;
-        }
-
-        .hiring-kpi .metric {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 1rem;
-        }
-
-        .hiring-kpi .metric i {
-            font-size: 1.5rem;
-        }
-
-        .purpose-card,
-        .workflow-card {
-            grid-column: span 12;
-        }
-
-        .postings-card {
-            grid-column: span 8;
-        }
-
-        .channels-card,
-        .alerts-card {
+         .hiring-form-card {
             grid-column: span 4;
         }
 
-        .automation-card {
-            grid-column: span 6;
+        .hiring-table-card {
+            grid-column: span 8;
         }
 
-        .alerts-card .alert-item,
-        .automation-card .automation-item,
-        .workflow-step {
-            border: 1px solid var(--gray-200);
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+         .form-label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 0.35rem;
+        }
+
+        .form-input,
+        .form-select,
+        .form-textarea {
+            width: 100%;
+            padding: 0.6rem 0.75rem;
+            border: 1px solid var(--gray-300);
             border-radius: var(--radius);
-            padding: 1rem;
-            background: white;
+            background: #fff;
         }
 
-        .alert-item + .alert-item,
-        .automation-item + .automation-item,
-        .workflow-step + .workflow-step {
-            margin-top: 1rem;
+        .form-textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+
+          .form-actions {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+        }
+
+        .badge-secondary {
+            background: var(--gray-400);
+            color: #fff;
+        }
+
+        .hint {
+            font-size: 0.85rem;
+            color: var(--gray-600);
         }
     </style>
 </head>
@@ -235,121 +217,122 @@ $workflow_steps = [
     <main class="container">
         <section class="page-header">
             <div>
-                <h1>HR Hiring Management</h1>
-                <p class="text-muted">Manage hiring posts, visibility, and automated follow-ups.</p>
+               <h1>Hiring Management</h1>
+                <p class="text-muted">Create, publish, and track hiring posts for <?php echo htmlspecialchars($shop_name); ?>.</p>
             </div>
-            <span class="badge badge-primary"><i class="fas fa-user-tie"></i> Module 27</span>
+            <span class="badge badge-primary"><i class="fas fa-user-tie"></i> Module 6.2</span>
         </section>
 
-        <section class="hiring-grid">
-            <?php foreach ($hiring_kpis as $kpi): ?>
-                <div class="card hiring-kpi">
-                    <div class="metric">
-                        <div>
-                            <p class="text-muted mb-1"><?php echo $kpi['label']; ?></p>
-                            <h3 class="mb-1"><?php echo $kpi['value']; ?></h3>
-                            <small class="text-muted"><?php echo $kpi['note']; ?></small>
-                        </div>
-                        <div class="icon-circle bg-<?php echo $kpi['tone']; ?> text-white">
-                            <i class="<?php echo $kpi['icon']; ?>"></i>
-                        </div>
-                    </div>
-                </div>
-            <?php endforeach; ?>
+        <?php if ($success): ?>
+            <div class="alert alert-success mb-2"><?php echo htmlspecialchars($success); ?></div>
+        <?php endif; ?>
+        <?php if ($error): ?>
+            <div class="alert alert-danger mb-2"><?php echo htmlspecialchars($error); ?></div>
+        <?php endif; ?>
 
-            <div class="card purpose-card">
-                <h2>Purpose</h2>
-                <p class="text-muted">Centralize hiring requests, job post visibility, and talent pipeline monitoring.</p>
+             <section class="hiring-layout">
+            <div class="card hiring-form-card">
+                <h2><?php echo $edit_post ? 'Edit hiring post' : 'Create hiring post'; ?></h2>
+                <form method="post" action="hiring_management.php<?php echo $edit_post ? '?edit=' . (int) $edit_post['id'] : ''; ?>">
+                    <input type="hidden" name="action" value="<?php echo $edit_post ? 'update' : 'create'; ?>">
+                    <?php if ($edit_post): ?>
+                        <input type="hidden" name="post_id" value="<?php echo (int) $edit_post['id']; ?>">
+                    <?php endif; ?>
+                    <div class="form-group">
+                        <label class="form-label" for="title">Role title</label>
+                        <input class="form-input" id="title" name="title" required value="<?php echo htmlspecialchars($edit_post['title'] ?? ''); ?>">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="description">Description</label>
+                        <textarea class="form-textarea" id="description" name="description" placeholder="Role overview, responsibilities, and requirements."><?php echo htmlspecialchars($edit_post['description'] ?? ''); ?></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="status">Status</label>
+                        <select class="form-select" id="status" name="status">
+                            <?php
+                            $current_status = $edit_post['status'] ?? 'draft';
+                            $statuses = ['draft' => 'Draft', 'live' => 'Live', 'closed' => 'Closed', 'expired' => 'Expired'];
+                            foreach ($statuses as $value => $label):
+                                $selected = $current_status === $value ? 'selected' : '';
+                                echo "<option value=\"{$value}\" {$selected}>{$label}</option>";
+                            endforeach;
+                            ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label" for="expires_at">Expires at</label>
+                        <input
+                            class="form-input"
+                            id="expires_at"
+                            name="expires_at"
+                            type="datetime-local"
+                            value="<?php echo $edit_post && $edit_post['expires_at'] ? date('Y-m-d\TH:i', strtotime($edit_post['expires_at'])) : ''; ?>"
+                        >
+                        <div class="hint">Posts automatically move to expired once the date/time passes.</div>
+                    </div>
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary">
+                            <?php echo $edit_post ? 'Save changes' : 'Create post'; ?>
+                        </button>
+                        <?php if ($edit_post): ?>
+                            <a href="hiring_management.php" class="btn btn-secondary">Cancel</a>
+                        <?php endif; ?>
+                    </div>
+                </form>
             </div>
 
-            <div class="card postings-card">
-                <h2>Active hiring posts</h2>
+           <div class="card hiring-table-card">
+                <h2>Hiring posts</h2>
                 <div class="table-responsive">
                     <table>
                         <thead>
                             <tr>
                                 <th>Role</th>
-                                <th>Team</th>
-                                <th>Location</th>
-                                <th>Posted</th>
+                                <th>Status</th>
+                                <th>Created</th>
                                 <th>Expires</th>
-                                <th>Status</th>
+                                <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <?php foreach ($active_postings as $posting): ?>
+                            <?php if (empty($hiring_posts)): ?>
                                 <tr>
-                                    <td><?php echo $posting['role']; ?></td>
-                                    <td><?php echo $posting['team']; ?></td>
-                                    <td><?php echo $posting['location']; ?></td>
-                                    <td><?php echo $posting['posted']; ?></td>
-                                    <td><?php echo $posting['expires']; ?></td>
-                                    <td><span class="badge badge-outline"><?php echo $posting['status']; ?></span></td>
+                                   <td colspan="5" class="text-muted">No hiring posts yet. Create your first role.</td>
                                 </tr>
-                            <?php endforeach; ?>
+                           <?php else: ?>
+                                <?php foreach ($hiring_posts as $post): ?>
+                                    <tr>
+                                        <td>
+                                            <strong><?php echo htmlspecialchars($post['title']); ?></strong>
+                                            <?php if (!empty($post['description'])): ?>
+                                                <div class="text-muted small"><?php echo nl2br(htmlspecialchars($post['description'])); ?></div>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td>
+                                            <span class="badge <?php echo status_badge_class($post['status']); ?>">
+                                                <?php echo ucfirst($post['status']); ?>
+                                            </span>
+                                        </td>
+                                        <td><?php echo date('M d, Y', strtotime($post['created_at'])); ?></td>
+                                        <td>
+                                            <?php echo $post['expires_at'] ? date('M d, Y H:i', strtotime($post['expires_at'])) : '—'; ?>
+                                        </td>
+                                        <td>
+                                            <div class="d-flex gap-2">
+                                                <a class="btn btn-sm btn-secondary" href="hiring_management.php?edit=<?php echo (int) $post['id']; ?>">Edit</a>
+                                                <form method="post" onsubmit="return confirm('Delete this hiring post?');">
+                                                    <input type="hidden" name="action" value="delete">
+                                                    <input type="hidden" name="post_id" value="<?php echo (int) $post['id']; ?>">
+                                                    <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                                                </form>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
-            </div>
-
-            <div class="card channels-card">
-                <h2>Visibility channels</h2>
-                <div class="table-responsive">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Channel</th>
-                                <th>Audience</th>
-                                <th>Reach</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($visibility_channels as $channel): ?>
-                                <tr>
-                                    <td><?php echo $channel['channel']; ?></td>
-                                    <td><?php echo $channel['audience']; ?></td>
-                                    <td><?php echo $channel['reach']; ?></td>
-                                    <td><span class="badge badge-outline"><?php echo $channel['status']; ?></span></td>
-                                </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <div class="card alerts-card">
-                <h2>Hiring alerts</h2>
-                <?php foreach ($alert_queue as $alert): ?>
-                    <div class="alert-item">
-                        <span class="badge badge-<?php echo $alert['tone']; ?> mb-2"><?php echo $alert['title']; ?></span>
-                        <p class="mb-2"><?php echo $alert['detail']; ?></p>
-                        <small class="text-muted"><?php echo $alert['time']; ?></small>
-                    </div>
-                <?php endforeach; ?>
-            </div>
-
-            <div class="card automation-card">
-                <h2>Automation</h2>
-                <?php foreach ($automation_rules as $rule): ?>
-                    <div class="automation-item">
-                        <div class="d-flex align-center gap-2 mb-2">
-                            <i class="<?php echo $rule['icon']; ?> text-primary"></i>
-                            <strong><?php echo $rule['title']; ?></strong>
-                        </div>
-                        <p class="text-muted mb-0"><?php echo $rule['detail']; ?></p>
-                    </div>
-                <?php endforeach; ?>
-            </div>
-
-            <div class="card workflow-card">
-                <h2>Hiring workflow</h2>
-                <?php foreach ($workflow_steps as $step): ?>
-                    <div class="workflow-step">
-                        <strong><?php echo $step['title']; ?></strong>
-                        <p class="text-muted mb-0"><?php echo $step['detail']; ?></p>
-                    </div>
-                <?php endforeach; ?>
             </div>
         </section>
     </main>
