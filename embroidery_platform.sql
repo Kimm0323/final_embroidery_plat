@@ -617,6 +617,19 @@ CREATE TABLE `raw_materials` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+
+-- Table structure for table `inventory_transactions`
+--
+
+CREATE TABLE `inventory_transactions` (
+  `id` int(11) NOT NULL,
+  `material_id` int(11) NOT NULL,
+  `order_id` int(11) DEFAULT NULL,
+  `transaction_type` enum('adjustment','deduction','addition') NOT NULL DEFAULT 'adjustment',
+  `quantity` decimal(10,2) NOT NULL DEFAULT 0.00,
+  `notes` text DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 -- --------------------------------------------------------
 --
 -- Audit immutability and sensitive change tracking
@@ -1132,6 +1145,13 @@ ALTER TABLE `attendance_logs`
 ALTER TABLE `raw_materials`
   ADD PRIMARY KEY (`id`);
 
+-- Indexes for table `inventory_transactions`
+--
+ALTER TABLE `inventory_transactions`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `material_id` (`material_id`),
+  ADD KEY `order_id` (`order_id`);
+
 --
 -- Indexes for table `services`
 --
@@ -1388,6 +1408,10 @@ ALTER TABLE `attendance_logs`
 ALTER TABLE `raw_materials`
   MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
 
+-- AUTO_INCREMENT for table `inventory_transactions`
+--
+ALTER TABLE `inventory_transactions`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
 --
 -- AUTO_INCREMENT for table `services`
 --
@@ -1513,6 +1537,12 @@ ALTER TABLE `job_schedule`
 ALTER TABLE `material_orders`
   ADD CONSTRAINT `material_orders_ibfk_1` FOREIGN KEY (`material_id`) REFERENCES `raw_materials` (`id`);
 
+
+-- Constraints for table `inventory_transactions`
+--
+ALTER TABLE `inventory_transactions`
+  ADD CONSTRAINT `inventory_transactions_ibfk_1` FOREIGN KEY (`material_id`) REFERENCES `raw_materials` (`id`),
+  ADD CONSTRAINT `inventory_transactions_ibfk_2` FOREIGN KEY (`order_id`) REFERENCES `orders` (`id`);
 --
 -- Constraints for table `notifications`
 --

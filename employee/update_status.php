@@ -253,6 +253,42 @@ if(isset($_POST['update_status'])) {
             if($status === 'completed') {
                 $complete_stmt = $pdo->prepare("UPDATE orders SET completed_at = NOW() WHERE id = ?");
                 $complete_stmt->execute([$order_id]);
+                $deduction_check = $pdo->prepare("
+                    SELECT COUNT(*)
+                    FROM inventory_transactions
+                    WHERE order_id = ? AND transaction_type = 'deduction'
+                ");
+                $deduction_check->execute([$order_id]);
+
+                if ((int) $deduction_check->fetchColumn() === 0) {
+                    $materials_stmt = $pdo->query("
+                        SELECT id
+                        FROM raw_materials
+                        WHERE status = 'active'
+                    ");
+                    $materials = $materials_stmt->fetchAll();
+
+                    if ($materials) {
+                        $deduct_stmt = $pdo->prepare("
+                            UPDATE raw_materials
+                            SET current_stock = GREATEST(current_stock - ?, 0)
+                            WHERE id = ?
+                        ");
+                        $transaction_stmt = $pdo->prepare("
+                            INSERT INTO inventory_transactions (material_id, order_id, transaction_type, quantity, notes)
+                            VALUES (?, ?, 'deduction', ?, ?)
+                        ");
+                        foreach ($materials as $material) {
+                            $deduct_stmt->execute([1, (int) $material['id']]);
+                            $transaction_stmt->execute([
+                                (int) $material['id'],
+                                $order_id,
+                                1,
+                                'Auto-deduct on order completion',
+                            ]);
+                        }
+                    }
+                }
             }
 
             if($order_info && $order_info['status'] !== $status) {
