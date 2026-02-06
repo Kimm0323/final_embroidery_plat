@@ -5,115 +5,173 @@ require_role('hr');
 
 $hr_name = htmlspecialchars($_SESSION['user']['fullname'] ?? 'HR Lead');
 
+$orderTotals = $pdo->query("
+    SELECT
+        COUNT(*) as total_orders,
+        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_orders,
+        AVG(CASE WHEN status = 'completed' AND completed_at IS NOT NULL THEN TIMESTAMPDIFF(HOUR, created_at, completed_at) END) as avg_completion_hours,
+        SUM(CASE WHEN status = 'completed' THEN quantity ELSE 0 END) as completed_pieces
+    FROM orders
+")->fetch();
+
+$qcTotals = $pdo->query("
+    SELECT
+        COUNT(*) as total_events,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed_events
+    FROM order_fulfillment_history
+")->fetch();
+
+$staffProductivity = $pdo->query("
+    SELECT
+        u.id,
+        u.fullname,
+        COUNT(o.id) as total_assigned,
+        SUM(CASE WHEN o.status = 'completed' THEN 1 ELSE 0 END) as completed_orders,
+        SUM(CASE WHEN o.status IN ('accepted', 'in_progress') THEN 1 ELSE 0 END) as active_orders,
+        AVG(CASE WHEN o.status = 'completed' AND o.completed_at IS NOT NULL THEN TIMESTAMPDIFF(HOUR, o.created_at, o.completed_at) END) as avg_completion_hours,
+        SUM(CASE WHEN o.status = 'completed' THEN o.quantity ELSE 0 END) as completed_pieces,
+        COALESCE(qc.qc_failures, 0) as qc_failures
+    FROM users u
+    LEFT JOIN orders o ON o.assigned_to = u.id
+    LEFT JOIN (
+        SELECT
+            o2.assigned_to as staff_id,
+            COUNT(ofh.id) as qc_failures
+        FROM order_fulfillment_history ofh
+        JOIN order_fulfillments ofl ON ofl.id = ofh.fulfillment_id
+        JOIN orders o2 ON o2.id = ofl.order_id
+        WHERE ofh.status = 'failed'
+        GROUP BY o2.assigned_to
+    ) qc ON qc.staff_id = u.id
+    WHERE u.role = 'staff'
+    GROUP BY u.id, u.fullname, qc.qc_failures
+    ORDER BY completed_orders DESC, completed_pieces DESC, u.fullname
+")->fetchAll();
+
+$totalOrders = (int) ($orderTotals['total_orders'] ?? 0);
+$completedOrders = (int) ($orderTotals['completed_orders'] ?? 0);
+$avgCompletionHours = $orderTotals['avg_completion_hours'] !== null ? (float) $orderTotals['avg_completion_hours'] : null;
+$completedPieces = (int) ($orderTotals['completed_pieces'] ?? 0);
+$totalQcEvents = (int) ($qcTotals['total_events'] ?? 0);
+$failedQcEvents = (int) ($qcTotals['failed_events'] ?? 0);
+
+$completionRate = $totalOrders > 0 ? ($completedOrders / $totalOrders) * 100 : null;
+$qcFailureRate = $totalQcEvents > 0 ? ($failedQcEvents / $totalQcEvents) * 100 : null;
+
+
 $productivity_kpis = [
     [
         'label' => 'Completion rate',
-        'value' => '92%',
-        'note' => 'Across all active teams',
+        'value' => $completionRate !== null ? number_format($completionRate, 1) . '%' : '—',
+        'note' => $totalOrders > 0
+            ? sprintf('%d of %d orders completed', $completedOrders, $totalOrders)
+            : 'No orders logged yet',
         'icon' => 'fas fa-check-double',
         'tone' => 'success',
     ],
     [
         'label' => 'Avg. cycle time',
-        'value' => '4.6 hrs',
-        'note' => 'Down 8% vs last month',
+        'value' => $avgCompletionHours !== null ? number_format($avgCompletionHours, 1) . ' hrs' : '—',
+        'note' => $avgCompletionHours !== null ? 'Based on completed orders' : 'Awaiting completed orders',
         'icon' => 'fas fa-stopwatch',
         'tone' => 'primary',
     ],
     [
         'label' => 'QC failure rate',
-        'value' => '3.1%',
-        'note' => 'Target ≤ 4%',
+        'value' => $qcFailureRate !== null ? number_format($qcFailureRate, 1) . '%' : '—',
+        'note' => $totalQcEvents > 0
+            ? sprintf('%d failures logged', $failedQcEvents)
+            : 'No QC events tracked',
         'icon' => 'fas fa-triangle-exclamation',
         'tone' => 'warning',
     ],
     [
         'label' => 'Output volume',
-        'value' => '1,248 pcs',
-        'note' => 'This week to date',
+       'value' => number_format($completedPieces) . ' pcs',
+        'note' => $completedPieces > 0 ? 'Completed order quantity' : 'No completed output yet',
         'icon' => 'fas fa-box-open',
         'tone' => 'info',
     ],
 ];
 
-$team_performance = [
-    [
-        'team' => 'Embroidery Line A',
-        'completion' => '95%',
-        'speed' => '4.1 hrs',
-        'qc' => '2.4%',
-        'output' => '412 pcs',
-        'trend' => 'Upward',
-    ],
-    [
-        'team' => 'Embroidery Line B',
-        'completion' => '91%',
-        'speed' => '4.8 hrs',
-        'qc' => '3.7%',
-        'output' => '366 pcs',
-        'trend' => 'Stable',
-    ],
-    [
-        'team' => 'Finishing & Pack',
-        'completion' => '89%',
-        'speed' => '5.2 hrs',
-        'qc' => '4.1%',
-        'output' => '287 pcs',
-        'trend' => 'Watch',
-    ],
-    [
-        'team' => 'QC Review',
-        'completion' => '97%',
-        'speed' => '3.6 hrs',
-        'qc' => '1.9%',
-        'output' => '183 pcs',
-        'trend' => 'Upward',
-    ],
-];
+$topCompleter = null;
+$fastestStaff = null;
+$highestQc = null;
+$topOutput = null;
+
+foreach ($staffProductivity as $staff) {
+    if ($topCompleter === null || (int) $staff['completed_orders'] > (int) $topCompleter['completed_orders']) {
+        $topCompleter = $staff;
+    }
+    if ($staff['avg_completion_hours'] !== null) {
+        if ($fastestStaff === null || (float) $staff['avg_completion_hours'] < (float) $fastestStaff['avg_completion_hours']) {
+            $fastestStaff = $staff;
+        }
+    }
+    if ($highestQc === null || (int) $staff['qc_failures'] > (int) $highestQc['qc_failures']) {
+        $highestQc = $staff;
+    }
+    if ($topOutput === null || (int) $staff['completed_pieces'] > (int) $topOutput['completed_pieces']) {
+        $topOutput = $staff;
+    }
+}
 
 $focus_insights = [
     [
-        'title' => 'Completion rate',
-        'detail' => 'High priority orders are closing 12% faster after rescheduling.',
+        'title' => 'Top completer',
+        'detail' => $topCompleter && $topCompleter['completed_orders'] > 0
+            ? sprintf('%s completed %d orders.', $topCompleter['fullname'], $topCompleter['completed_orders'])
+            : 'No completed orders recorded yet.',
         'icon' => 'fas fa-chart-line',
     ],
     [
-        'title' => 'Speed',
-        'detail' => 'Line B benefits from new machine calibration; replicate setup.',
+       'title' => 'Fastest cycle',
+        'detail' => $fastestStaff && $fastestStaff['avg_completion_hours'] !== null
+            ? sprintf('%s averages %s hrs per completed order.', $fastestStaff['fullname'], number_format($fastestStaff['avg_completion_hours'], 1))
+            : 'Cycle time will populate once orders complete.',
         'icon' => 'fas fa-gauge-high',
     ],
     [
         'title' => 'QC failures',
-        'detail' => 'Most defects traced to thread tension on 2 machines.',
+        'detail' => $failedQcEvents > 0 && $highestQc
+            ? sprintf('%s has %d logged QC failures.', $highestQc['fullname'], $highestQc['qc_failures'])
+            : 'No QC failures logged in fulfillment history.',
         'icon' => 'fas fa-screwdriver-wrench',
     ],
     [
         'title' => 'Output volume',
-        'detail' => 'Overtime shift lifted output by 9% this week.',
+         'detail' => $topOutput && $topOutput['completed_pieces'] > 0
+            ? sprintf('%s delivered %d completed pieces.', $topOutput['fullname'], $topOutput['completed_pieces'])
+            : 'Output volume will update after completions.',
         'icon' => 'fas fa-layer-group',
     ],
 ];
 
-$anomalies = [
-    [
-        'title' => 'Spike in QC failures',
-        'detail' => 'Line B hit 6% failure rate on Aug 24. Inspect thread batch.',
-        'time' => '2 days ago',
-        'tone' => 'danger',
-    ],
-    [
-        'title' => 'Cycle time drift',
-        'detail' => 'Finishing tasks averaged 6.1 hrs on the night shift.',
-        'time' => 'Yesterday',
+$anomalies = [];
+if ($qcFailureRate !== null && $qcFailureRate > 0) {
+    $anomalies[] = [
+        'title' => 'QC failures logged',
+        'detail' => sprintf('%d QC failure events recorded in fulfillment history.', $failedQcEvents),
+        'time' => 'Current period',
         'tone' => 'warning',
-    ],
-    [
-        'title' => 'Output surge',
-        'detail' => 'Line A produced 18% above target after automation tweak.',
-        'time' => 'Today',
+     ];
+}
+if ($avgCompletionHours !== null && $avgCompletionHours > 6) {
+    $anomalies[] = [
+        'title' => 'Cycle time above 6 hrs',
+        'detail' => sprintf('Average completion time is %s hrs.', number_format($avgCompletionHours, 1)),
+        'time' => 'Current period',
+        'tone' => 'danger',
+    ];
+}
+if ($completedPieces > 0) {
+    $anomalies[] = [
+        'title' => 'Output recorded',
+        'detail' => sprintf('%d pieces completed across all staff.', $completedPieces),
+        'time' => 'Current period',
         'tone' => 'success',
-    ],
-];
+    ];
+}
 
 $automation_items = [
     [
@@ -273,34 +331,54 @@ $workflow_steps = [
 
             <div class="card purpose-card">
                 <h2>Purpose</h2>
-                <p class="text-muted">Give HR a single view of staff throughput, speed, and quality for proactive coaching.</p>
+                 <p class="text-muted">
+                    Give HR a single view of staff throughput, speed, and quality for proactive coaching. QC failure rates are
+                    derived from fulfillment history entries marked as failed.
+                </p>
             </div>
 
             <div class="card team-performance-card">
-                <h2>Team performance snapshot</h2>
+                 <h2>Staff productivity snapshot</h2>
                 <div class="table-responsive">
                     <table>
                         <thead>
                             <tr>
-                                <th>Team</th>
+                                <th>Staff member</th>
                                 <th>Completion</th>
                                 <th>Speed</th>
                                 <th>QC failures</th>
                                 <th>Output</th>
-                                <th>Trend</th>
+                                <th>Active</th>
                             </tr>
                         </thead>
                         <tbody>
-                            <?php foreach ($team_performance as $team): ?>
+                             <?php if (empty($staffProductivity)): ?>
                                 <tr>
-                                    <td><?php echo $team['team']; ?></td>
-                                    <td><?php echo $team['completion']; ?></td>
-                                    <td><?php echo $team['speed']; ?></td>
-                                    <td><?php echo $team['qc']; ?></td>
-                                    <td><?php echo $team['output']; ?></td>
-                                    <td><span class="trend-pill"><?php echo $team['trend']; ?></span></td>
+                                    <td colspan="6" class="text-muted">No staff productivity data available yet.</td>
                                 </tr>
-                            <?php endforeach; ?>
+                                  <?php else: ?>
+                                <?php foreach ($staffProductivity as $staff): ?>
+                                    <?php
+                                        $completion = (int) $staff['total_assigned'] > 0
+                                            ? number_format(((int) $staff['completed_orders'] / (int) $staff['total_assigned']) * 100, 1) . '%'
+                                            : '—';
+                                        $speed = $staff['avg_completion_hours'] !== null
+                                            ? number_format($staff['avg_completion_hours'], 1) . ' hrs'
+                                            : '—';
+                                        $qcFailures = number_format((int) $staff['qc_failures']);
+                                        $output = number_format((int) $staff['completed_pieces']) . ' pcs';
+                                        $activeOrders = (int) $staff['active_orders'];
+                                    ?>
+                                    <tr>
+                                        <td><?php echo htmlspecialchars($staff['fullname']); ?></td>
+                                        <td><?php echo $completion; ?></td>
+                                        <td><?php echo $speed; ?></td>
+                                        <td><?php echo $qcFailures; ?></td>
+                                        <td><?php echo $output; ?></td>
+                                        <td><span class="trend-pill"><?php echo $activeOrders; ?> active</span></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            <?php endif; ?>
                         </tbody>
                     </table>
                 </div>
@@ -321,13 +399,17 @@ $workflow_steps = [
 
             <div class="card anomalies-card">
                 <h2>Anomaly detection</h2>
-                <?php foreach ($anomalies as $anomaly): ?>
-                    <div class="anomaly-item">
-                        <span class="badge badge-<?php echo $anomaly['tone']; ?> mb-2"><?php echo $anomaly['title']; ?></span>
-                        <p class="mb-2"><?php echo $anomaly['detail']; ?></p>
-                        <small class="text-muted"><?php echo $anomaly['time']; ?></small>
-                    </div>
-                <?php endforeach; ?>
+                 <?php if (empty($anomalies)): ?>
+                    <p class="text-muted mb-0">No anomalies detected from current order and QC data.</p>
+                <?php else: ?>
+                    <?php foreach ($anomalies as $anomaly): ?>
+                        <div class="anomaly-item">
+                            <span class="badge badge-<?php echo $anomaly['tone']; ?> mb-2"><?php echo $anomaly['title']; ?></span>
+                            <p class="mb-2"><?php echo $anomaly['detail']; ?></p>
+                            <small class="text-muted"><?php echo $anomaly['time']; ?></small>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
             </div>
 
             <div class="card automation-card">
