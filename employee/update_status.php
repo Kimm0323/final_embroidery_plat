@@ -65,6 +65,40 @@ function fetch_order_info(PDO $pdo, int $staff_id, int $order_id): ?array {
     return $order_info ?: null;
 }
 
+function fetch_service_provider_id(PDO $pdo, int $owner_id): ?int {
+    $provider_stmt = $pdo->prepare("SELECT id FROM service_providers WHERE user_id = ? LIMIT 1");
+    $provider_stmt->execute([$owner_id]);
+    $provider_id = $provider_stmt->fetchColumn();
+    return $provider_id ? (int) $provider_id : null;
+}
+
+$proof_success = null;
+$proof_error = null;
+function is_design_approved(PDO $pdo, int $staff_id, int $order_id): bool {
+    $approval_stmt = $pdo->prepare("
+        SELECT
+            o.design_approved,
+            EXISTS (
+                SELECT 1
+                FROM design_approvals da
+                WHERE da.order_id = o.id
+                  AND da.status = 'approved'
+            ) as approval_record
+        FROM orders o
+        LEFT JOIN job_schedule js ON js.order_id = o.id AND js.staff_id = ?
+        WHERE o.id = ? AND (o.assigned_to = ? OR js.staff_id = ?)
+        LIMIT 1
+    ");
+    $approval_stmt->execute([$staff_id, $order_id, $staff_id, $staff_id]);
+    $approval = $approval_stmt->fetch();
+
+    if(!$approval) {
+        return false;
+    }
+
+    return (int) $approval['design_approved'] === 1 || (int) $approval['approval_record'] === 1;
+}
+
 if(!empty($jobs)) {
     $job_ids = array_column($jobs, 'id');
     $placeholders = implode(',', array_fill(0, count($job_ids), '?'));
@@ -124,6 +158,58 @@ if(isset($_POST['escalate_issue'])) {
     }
 }
 
+if(isset($_POST['submit_proof'])) {
+    $order_id = (int) ($_POST['order_id'] ?? 0);
+    $proof_file = trim((string) ($_POST['proof_file'] ?? ''));
+    $order_info = fetch_order_info($pdo, $staff_id, $order_id);
+
+    if(!$order_info) {
+        $proof_error = "Unable to upload a proof for this order.";
+    } elseif($proof_file === '') {
+        $proof_error = "Please upload a proof file before submitting.";
+    } else {
+        $service_provider_id = fetch_service_provider_id($pdo, (int) $order_info['owner_id']);
+        if(!$service_provider_id) {
+            $proof_error = "Service provider profile not found. Please contact your shop owner.";
+        } else {
+            $approval_stmt = $pdo->prepare("SELECT id FROM design_approvals WHERE order_id = ? LIMIT 1");
+            $approval_stmt->execute([$order_id]);
+            $approval = $approval_stmt->fetch();
+
+            if($approval) {
+                $update_stmt = $pdo->prepare("
+                    UPDATE design_approvals
+                    SET design_file = ?, status = 'pending', updated_at = NOW()
+                    WHERE id = ?
+                ");
+                $update_stmt->execute([$proof_file, $approval['id']]);
+            } else {
+                $insert_stmt = $pdo->prepare("
+                    INSERT INTO design_approvals (order_id, service_provider_id, design_file, status, created_at, updated_at)
+                    VALUES (?, ?, ?, 'pending', NOW(), NOW())
+                ");
+                $insert_stmt->execute([$order_id, $service_provider_id, $proof_file]);
+            }
+
+            $order_update_stmt = $pdo->prepare("
+                UPDATE orders
+                SET design_approved = 0, updated_at = NOW()
+                WHERE id = ?
+            ");
+            $order_update_stmt->execute([$order_id]);
+
+            $message = sprintf('A design proof is ready for order #%s. Please review it.', $order_info['order_number']);
+            create_notification($pdo, (int) $order_info['client_id'], $order_id, 'proof', $message);
+            if(!empty($order_info['owner_id'])) {
+                create_notification($pdo, (int) $order_info['owner_id'], $order_id, 'proof', 'A design proof was uploaded by staff.');
+            }
+            create_notification($pdo, (int) $staff_id, $order_id, 'proof', 'Proof uploaded and sent to client.');
+
+            $proof_success = "Proof uploaded and sent to the client.";
+        }
+    }
+}
+
 if(isset($_POST['update_status'])) {
     $order_id = (int) ($_POST['order_id'] ?? 0);
     $progress = (int) ($_POST['progress'] ?? 0);
@@ -148,6 +234,8 @@ if(isset($_POST['update_status'])) {
         $error = "Please upload a progress photo before updating the status.";
     } elseif(!in_array($status, $allowed_statuses, true)) {
         $error = "Invalid status selection.";
+         } elseif($status === STATUS_IN_PROGRESS && !is_design_approved($pdo, $staff_id, $order_id)) {
+        $error = "Design proof must be approved before starting production.";
     } elseif(!can_transition_order_status($order_info['status'], $status)) {
         $error = "Status transition not allowed from the current state.";
     } else {
@@ -373,6 +461,14 @@ if(isset($_POST['update_status'])) {
             <div class="alert alert-success"><?php echo $success; ?></div>
         <?php endif; ?>
 
+         <?php if($proof_error): ?>
+            <div class="alert alert-danger"><?php echo htmlspecialchars($proof_error); ?></div>
+        <?php endif; ?>
+
+        <?php if($proof_success): ?>
+            <div class="alert alert-success"><?php echo htmlspecialchars($proof_success); ?></div>
+        <?php endif; ?>
+
         <?php if(!empty($jobs)): ?>
             <?php foreach($jobs as $job): ?>
                 <?php $has_photo = !empty($photo_counts[$job['id']]); ?>
@@ -401,6 +497,19 @@ if(isset($_POST['update_status'])) {
                                     </div>
                                 <?php endif; ?>
                             <?php endif; ?>
+                            <div class="proof-upload mt-3">
+                                <form method="POST" class="proof-upload-form" data-order-id="<?php echo (int) $job['id']; ?>">
+                                    <input type="hidden" name="order_id" value="<?php echo (int) $job['id']; ?>">
+                                    <input type="hidden" name="proof_file" value="">
+                                    <div class="form-group">
+                                        <label for="proof_file_<?php echo (int) $job['id']; ?>">Upload proof</label>
+                                        <input type="file" class="form-control" id="proof_file_<?php echo (int) $job['id']; ?>" name="proof_file_upload" accept=".jpg,.jpeg,.png,.gif" required>
+                                    </div>
+                                    <div class="proof-upload-status text-muted mb-2"></div>
+                                    <button type="submit" name="submit_proof" class="btn btn-outline" disabled>
+                                        <i class="fas fa-upload"></i> Submit Proof
+                                    </button>
+                                </form>
                             <?php if(!empty($job['schedule_date'])): ?>
                                 <p class="mb-0 text-muted">
                                     <i class="fas fa-calendar"></i> Scheduled: <?php echo date('M d, Y', strtotime($job['schedule_date'])); ?>
@@ -560,6 +669,51 @@ if(isset($_POST['update_status'])) {
             document.querySelectorAll('.progress-slider').forEach(slider => {
                 const jobId = slider.closest('.card').querySelector('input[name="order_id"]').value;
                 updateSteps(jobId, slider.value);
+            });
+        });
+    </script>
+    <script>
+        document.querySelectorAll('.proof-upload-form').forEach((form) => {
+            const fileInput = form.querySelector('input[type="file"]');
+            const hiddenInput = form.querySelector('input[name="proof_file"]');
+            const statusEl = form.querySelector('.proof-upload-status');
+            const submitBtn = form.querySelector('button[type="submit"]');
+
+            const uploadProof = async (file) => {
+                statusEl.textContent = 'Uploading proof...';
+                submitBtn.disabled = true;
+                hiddenInput.value = '';
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const response = await fetch('../api/upload_api.php', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result.error || 'Upload failed.');
+                    }
+                    hiddenInput.value = result.file.path;
+                    statusEl.textContent = 'Proof uploaded. You can now submit.';
+                    submitBtn.disabled = false;
+                } catch (err) {
+                    statusEl.textContent = err.message;
+                    submitBtn.disabled = true;
+                }
+            };
+
+            fileInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (!file) {
+                    statusEl.textContent = '';
+                    submitBtn.disabled = true;
+                    hiddenInput.value = '';
+                    return;
+                }
+                uploadProof(file);
             });
         });
     </script>

@@ -91,6 +91,62 @@ foreach($active_staff as $staff_member) {
     $active_staff_map[(int) $staff_member['user_id']] = $staff_member;
 }
 
+function fetch_service_provider_id(PDO $pdo, int $owner_id): ?int {
+    $provider_stmt = $pdo->prepare("SELECT id FROM service_providers WHERE user_id = ? LIMIT 1");
+    $provider_stmt->execute([$owner_id]);
+    $provider_id = $provider_stmt->fetchColumn();
+    return $provider_id ? (int) $provider_id : null;
+}
+
+$proof_success = null;
+$proof_error = null;
+
+if(isset($_POST['submit_proof'])) {
+    $proof_file = trim((string) ($_POST['proof_file'] ?? ''));
+    $service_provider_id = fetch_service_provider_id($pdo, $owner_id);
+
+    if($proof_file === '') {
+        $proof_error = "Please upload a proof file before submitting.";
+    } elseif(!$service_provider_id) {
+        $proof_error = "Service provider profile not found. Please contact support.";
+    } else {
+        $approval_stmt = $pdo->prepare("SELECT id FROM design_approvals WHERE order_id = ? LIMIT 1");
+        $approval_stmt->execute([$order_id]);
+        $approval = $approval_stmt->fetch();
+
+        if($approval) {
+            $update_stmt = $pdo->prepare("
+                UPDATE design_approvals
+                SET design_file = ?, status = 'pending', updated_at = NOW()
+                WHERE id = ?
+            ");
+            $update_stmt->execute([$proof_file, $approval['id']]);
+        } else {
+            $insert_stmt = $pdo->prepare("
+                INSERT INTO design_approvals (order_id, service_provider_id, design_file, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'pending', NOW(), NOW())
+            ");
+            $insert_stmt->execute([$order_id, $service_provider_id, $proof_file]);
+        }
+
+        $order_update_stmt = $pdo->prepare("
+            UPDATE orders
+            SET design_approved = 0, updated_at = NOW()
+            WHERE id = ?
+        ");
+        $order_update_stmt->execute([$order_id]);
+
+        $message = sprintf('A design proof is ready for order #%s. Please review it.', $order['order_number']);
+        create_notification($pdo, (int) $order['client_id'], $order_id, 'proof', $message);
+        create_notification($pdo, (int) $owner_id, $order_id, 'proof', 'A design proof was submitted for this order.');
+        if(!empty($order['assigned_to'])) {
+            create_notification($pdo, (int) $order['assigned_to'], $order_id, 'proof', 'A design proof was uploaded for this order.');
+        }
+
+        $proof_success = "Proof uploaded and sent to the client.";
+    }
+}
+
 if(isset($_POST['schedule_job'])) {
     $schedule_order_id = (int) ($_POST['order_id'] ?? 0);
     $staff_id = (int) ($_POST['staff_id'] ?? 0);
@@ -443,7 +499,12 @@ $is_design_image = $design_file_name && in_array($design_file_extension, ALLOWED
         <?php if(!empty($error)): ?>
             <div class="notice notice-error"><?php echo htmlspecialchars($error); ?></div>
         <?php endif; ?>
-
+         <?php if($proof_error): ?>
+            <div class="notice notice-error"><?php echo htmlspecialchars($proof_error); ?></div>
+        <?php endif; ?>
+        <?php if($proof_success): ?>
+            <div class="notice notice-success"><?php echo htmlspecialchars($proof_success); ?></div>
+        <?php endif; ?>
         <div class="action-row mb-3">
             <a href="dashboard.php" class="btn btn-outline-primary">
                 <i class="fas fa-arrow-left"></i> Back to Orders
@@ -546,6 +607,24 @@ $is_design_image = $design_file_name && in_array($design_file_extension, ALLOWED
         </div>
         
         <div class="card">
+            <h3>Design Proof Upload</h3>
+            <p class="text-muted">Upload the proof for client approval.</p>
+            <form method="POST" class="proof-upload-form">
+                <input type="hidden" name="proof_file" value="">
+                <div class="form-group">
+                    <label for="proof_file">Proof file</label>
+                    <input type="file" class="form-control" id="proof_file" name="proof_file_upload" accept=".jpg,.jpeg,.png,.gif" required>
+                    <small class="text-muted">Accepted formats: JPG, PNG, GIF. Max size 5MB.</small>
+                </div>
+                <div class="proof-upload-status text-muted mb-3"></div>
+                <button type="submit" name="submit_proof" class="btn btn-primary" disabled>
+                    <i class="fas fa-upload"></i> Submit Proof
+                </button>
+            </form>
+        </div>
+
+
+        <div class="card">
             <h3>Schedule & Capacity</h3>
             <?php if($schedule_entry): ?>
                 <div class="schedule-summary mb-3">
@@ -606,5 +685,53 @@ $is_design_image = $design_file_name && in_array($design_file_extension, ALLOWED
             </form>
         </div>
     </div>
+     <script>
+        const proofForm = document.querySelector('.proof-upload-form');
+        if (proofForm) {
+            const fileInput = proofForm.querySelector('input[type="file"]');
+            const hiddenInput = proofForm.querySelector('input[name="proof_file"]');
+            const statusEl = proofForm.querySelector('.proof-upload-status');
+            const submitBtn = proofForm.querySelector('button[type="submit"]');
+
+            const uploadProof = async (file) => {
+                statusEl.textContent = 'Uploading proof...';
+                submitBtn.disabled = true;
+                hiddenInput.value = '';
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                try {
+                    const response = await fetch('../api/upload_api.php', {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    const result = await response.json();
+                    if (!response.ok) {
+                        throw new Error(result.error || 'Upload failed.');
+                    }
+
+                    hiddenInput.value = result.file.path;
+                    statusEl.textContent = 'Proof uploaded. You can now submit.';
+                    submitBtn.disabled = false;
+                } catch (err) {
+                    statusEl.textContent = err.message;
+                    submitBtn.disabled = true;
+                }
+            };
+
+            fileInput.addEventListener('change', (event) => {
+                const file = event.target.files[0];
+                if (!file) {
+                    statusEl.textContent = '';
+                    submitBtn.disabled = true;
+                    hiddenInput.value = '';
+                    return;
+                }
+                uploadProof(file);
+            });
+        }
+    </script>
 </body>
 </html>

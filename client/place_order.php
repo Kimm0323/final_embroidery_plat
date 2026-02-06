@@ -40,7 +40,7 @@ $default_pricing_settings = [
 $search_term = sanitize($_GET['search'] ?? '');
 $service_filter = sanitize($_GET['service'] ?? '');
 $open_filter = sanitize($_GET['open'] ?? '');
-
+$prefill_design_version_id = sanitize($_GET['design_version_id'] ?? $_POST['design_version_id'] ?? '');
 function validate_design_description(string $description): string {
     $trimmed = trim($description);
     $length = mb_strlen($trimmed);
@@ -311,6 +311,7 @@ if(isset($_POST['place_order'])) {
     $service_type = sanitize($_POST['service_type'] ?? '');
     $custom_service = sanitize($_POST['custom_service'] ?? '');
     $design_description = sanitize($_POST['design_description'] ?? '');
+     $design_version_id = (int) ($_POST['design_version_id'] ?? 0);
     $quantity = (int) ($_POST['quantity'] ?? 0);
     $client_notes = sanitize($_POST['client_notes'] ?? '');
     $complexity_level = sanitize($_POST['complexity_level'] ?? 'Standard');
@@ -422,6 +423,25 @@ if(isset($_POST['place_order'])) {
         ]);
         
         $order_id = $pdo->lastInsertId();
+
+         $design_preview_file = null;
+        if ($design_version_id > 0) {
+            $design_version_stmt = $pdo->prepare("
+                SELECT dv.id, dv.preview_file
+                FROM design_versions dv
+                INNER JOIN design_projects dp ON dv.project_id = dp.id
+                WHERE dv.id = ? AND dp.client_id = ?
+            ");
+            $design_version_stmt->execute([$design_version_id, $client_id]);
+            $design_version = $design_version_stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$design_version) {
+                throw new RuntimeException('Selected design version is not available.');
+            }
+            $design_preview_file = $design_version['preview_file'] ?: null;
+            $update_design_stmt = $pdo->prepare("UPDATE orders SET design_version_id = ? WHERE id = ?");
+            $update_design_stmt->execute([$design_version_id, $order_id]);
+        }
+
         
         // Handle file upload
         if(isset($_FILES['design_file']) && $_FILES['design_file']['error'] !== UPLOAD_ERR_NO_FILE) {
@@ -443,6 +463,12 @@ $upload = save_uploaded_media(
 
             $update_stmt = $pdo->prepare("UPDATE orders SET design_file = ? WHERE id = ?");
             $update_stmt->execute([$upload['filename'], $order_id]);
+             $design_preview_file = null;
+        }
+
+        if ($design_preview_file) {
+            $update_preview_stmt = $pdo->prepare("UPDATE orders SET design_file = ? WHERE id = ? AND design_file IS NULL");
+            $update_preview_stmt->execute([$design_preview_file, $order_id]);
         }
         
         // Update shop statistics
@@ -675,6 +701,7 @@ $upload = save_uploaded_media(
             </div>
         </form>
         <form method="POST" enctype="multipart/form-data" id="orderForm">
+             <input type="hidden" name="design_version_id" value="<?php echo htmlspecialchars($prefill_design_version_id); ?>">
             <!-- Step 1: Select Shop -->
             <div class="card mb-4">
                 <h3>Step 1: Select Service Provider</h3>
